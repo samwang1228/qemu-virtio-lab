@@ -5,7 +5,6 @@
 
 # Docker build state marker
 /.docker-sources-ready
-/patches/
 # Out-of-tree kernel module artifacts (guest-driver/)
 *.o
 *.ko

@@ -105,10 +105,25 @@ Linux (inside the Docker build volume, v6.12):
 
 ## 6. Custom device in this lab
 
-The custom device keeps the Virtio PCI transport and only replaces the device model: QEMU registers `virtio-custom-device`, and the Linux side is a `virtio_driver` (`guest-driver/virtio_custom.c`) that matches on the virtio device ID. Data flow is identical to the sections above; only `virtio_blk_handle_output()` is replaced by `virtio_custom_handle_output()`, which counts write requests and exposes the counter in config space. See [`patches/README.md`](../patches/README.md).
+The custom device keeps the Virtio PCI transport and replaces the device model:
+- **Virtio ID**: `VIRTIO_ID_CUSTOM 43` (both in Linux driver and QEMU). In modern Virtio-1.0 PCI namespace, this appears as PCI device ID `0x1040 + 43 = 0x106b`.
+- **QEMU**: Registers `virtio-custom-device` (virtio-bus) and `virtio-custom-pci` (PCI wrapper). It exposes a 64-bit `write_count` in its config space and handles queue requests in `virtio_custom_handle_output()`.
+- **Linux Driver**: `guest-driver/virtio_custom.c` defines a `virtio_driver` matching on `VIRTIO_ID_CUSTOM 43`.
 
-> [!WARNING]
-> `struct virtio_device_id` matches the **virtio device ID**, not the PCI device ID. The current value `VIRTIO_ID_CUSTOM 0x105a` is actually a PCI ID: `0x105a - 0x1040 = 26`, which is the assigned ID of **virtio-fs**. Pick a virtio ID that is unused in both `include/uapi/linux/virtio_ids.h` and QEMU's `include/standard-headers/linux/virtio_ids.h`, use the same value on both sides, and expect the PCI device ID to be `0x1040 + ID`.
+### Development & iteration workflow
 
-> [!IMPORTANT]
-> The guest kernel is built with `# CONFIG_MODULES is not set`, so `virtio_custom.ko` cannot be loaded with `insmod`. Either build the driver into the kernel (add it to the kernel tree and rebuild with `build-guest-docker.sh`) or enable `CONFIG_MODULES` and build the module inside the Docker container, since the Linux tree now lives in the Docker volume rather than `build/linux`.
+1. Build/rebuild driver module:
+   ```sh
+   ./scripts/build-driver-docker.sh
+   ```
+2. Launch QEMU with the custom device and 9p folder sharing:
+   ```sh
+   CUSTOM_DEVICE=1 ./scripts/run.sh
+   ```
+3. Inside the guest, mount the shared directory and load the module:
+   ```sh
+   mkdir -p /mnt
+   mount -t 9p -o trans=virtio host_share /mnt
+   insmod /mnt/virtio_custom.ko
+   ```
+   Check dmesg for `custom virtio device attached (id=43)`.

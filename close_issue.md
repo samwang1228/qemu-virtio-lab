@@ -145,3 +145,14 @@ output/qemu/bin/qemu-system-aarch64 -machine virt,help
 - `build-guest-docker.sh` 只把 `Image`、`rootfs.ext4` 複製回 macOS，不再複製 13 GB 的 Buildroot 中間檔。
 
 結果：`output/guest/Image` 與 `output/guest/rootfs.ext4` 已產生。
+
+## 12. QEMU 客製 Virtio 裝置缺少 `get_features` 回呼導致斷言失敗
+
+問題：
+以 `CUSTOM_DEVICE=1 ./scripts/run.sh` 啟動時發生 abort：
+```text
+Assertion failed: (vdc->get_features != NULL), function virtio_bus_device_plugged, file virtio-bus.c, line 65.
+```
+原因：QEMU 在將 virtio device 接上 virtio-bus 時，強制要求 `VirtioDeviceClass` 提供 `get_features` 回呼函式。初始骨架未設定此回呼。
+
+解法：在 [virtio-custom.c](file:///Users/wangshaocheng/Desktop/VM/qemu-virtio-lab/build/qemu/hw/virtio/virtio-custom.c) 實作 `virtio_custom_get_features` 並指派給 `vdc->get_features`。重新編譯後開機成功。

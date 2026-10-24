@@ -38,9 +38,7 @@ scripts=$(mktemp)
 trap 'rm -f "$scripts"' EXIT
 cat "$ROOT/config/linux-aarch64.config" > "$scripts"
 "$MAKE" -C "$LINUX" $KERNEL_MAKE_FLAGS KCONFIG_ALLCONFIG="$scripts" olddefconfig
-"$LINUX/scripts/config" --file "$LINUX/.config" --disable MODULES
-"$MAKE" -C "$LINUX" $KERNEL_MAKE_FLAGS olddefconfig
-"$MAKE" -C "$LINUX" $KERNEL_MAKE_FLAGS -j"$JOBS" Image
+"$MAKE" -C "$LINUX" $KERNEL_MAKE_FLAGS -j"$JOBS" Image modules
 cp "$LINUX/arch/arm64/boot/Image" "$OUT/Image"
 
 "$MAKE" -C "$BUILDROOT" O="$OUT/buildroot" qemu_aarch64_virt_defconfig

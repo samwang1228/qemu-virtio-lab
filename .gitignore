@@ -1,0 +1,31 @@
+# Sources and build trees (QEMU on macOS; Linux/Buildroot live in Docker volumes)
+/build/
+# Installed QEMU and guest artifacts (Image, rootfs.ext4)
+/output/
+
+# Docker build state marker
+/.docker-sources-ready
+/patches/
+# Out-of-tree kernel module artifacts (guest-driver/)
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+.*.d
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Disk images and logs created during experiments
+*.img
+*.qcow2
+*.log
+
+# Editors and OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~

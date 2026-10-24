@@ -1,0 +1,6 @@
+build/qemu
+build/linux
+build/buildroot
+output/
+.git/
+.DS_Store

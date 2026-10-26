@@ -1,4 +1,7 @@
 obj-m += virtio_custom.o
+virtio_custom-y := virtio_custom_main.o virtio_custom_dma.o virtio_custom_sysfs.o
+
+ccflags-y += -I$(src)/../include -I$(src)
 
 KDIR ?= /repo/build/linux
 ARCH ?= arm64

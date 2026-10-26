@@ -107,8 +107,18 @@ Linux (inside the Docker build volume, v6.12):
 
 The custom device keeps the Virtio PCI transport and replaces the device model:
 - **Virtio ID**: `VIRTIO_ID_CUSTOM 43` (both in Linux driver and QEMU). In modern Virtio-1.0 PCI namespace, this appears as PCI device ID `0x1040 + 43 = 0x106b`.
-- **QEMU**: Registers `virtio-custom-device` (virtio-bus) and `virtio-custom-pci` (PCI wrapper). It exposes a 64-bit `write_count` in its config space and handles queue requests in `virtio_custom_handle_output()`.
-- **Linux Driver**: `guest-driver/virtio_custom.c` defines a `virtio_driver` matching on `VIRTIO_ID_CUSTOM 43`.
+- **Shared UAPI Protocol Specification**: `include/uapi_virtio_custom.h` acts as the single source of truth for both QEMU hardware and Linux kernel drivers, defining `VIRTIO_ID_CUSTOM 43`, DMA opcodes, descriptors, and config space.
+- **QEMU Hardware**: Registers `virtio-custom-device` (virtio-bus) and `virtio-custom-pci` (PCI wrapper). It exposes configuration registers (`write_count`, `dma_transfers`, `dma_bytes`) and handles DMA queue processing in `virtio_custom_handle_output()`.
+- **Linux Driver Architecture**:
+  - `virtio_custom_main.c`: Bus driver registration, PCI/Virtio probe and remove lifecycle.
+  - `virtio_custom_dma.c`: DMA virtqueue submission, completion notification, and hardware self-test.
+  - `virtio_custom_sysfs.c`: Sysfs debugging interface (`/sys/bus/virtio/devices/virtio*/dma_test`).
+  - `virtio_custom.h`: Driver private struct and internal subsystem function prototypes.
+- **DMA Engine Capabilities**:
+  - Implements an asynchronous hardware DMA engine capable of reading from and writing to Guest Physical Addresses (GPA).
+  - Supports `VIRTIO_CUSTOM_DMA_COPY` (bulk physical memory memcpy), `VIRTIO_CUSTOM_DMA_FILL` (pattern fill), and `VIRTIO_CUSTOM_DMA_INVERT` (bitwise hardware transform).
+  - QEMU uses `cpu_physical_memory_read()` and `cpu_physical_memory_write()` to access guest RAM directly without CPU intervention.
+  - Exposes `/sys/bus/virtio/devices/virtio*/dma_test` in sysfs to re-trigger DMA hardware tests on demand.
 
 ### Development & iteration workflow
 
@@ -126,4 +136,11 @@ The custom device keeps the Virtio PCI transport and replaces the device model:
    mount -t 9p -o trans=virtio host_share /mnt
    insmod /mnt/virtio_custom.ko
    ```
-   Check dmesg for `custom virtio device attached (id=43)`.
+   Check dmesg for DMA self-test verification:
+   ```sh
+   dmesg | tail -n 25
+   ```
+   Or re-trigger via sysfs:
+   ```sh
+   cat /sys/bus/virtio/devices/virtio*/dma_test
+   ```

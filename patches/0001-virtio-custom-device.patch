@@ -94,10 +94,10 @@ index 0000000..2fcd3cf
 +type_init(virtio_custom_pci_register)
 diff --git a/hw/virtio/virtio-custom.c b/hw/virtio/virtio-custom.c
 new file mode 100644
-index 0000000..9556e72
+index 0000000..f1be779
 --- /dev/null
 +++ b/hw/virtio/virtio-custom.c
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,168 @@
 +/*
 + * Virtio Custom Device Implementation
 + *
@@ -116,14 +116,16 @@ index 0000000..9556e72
 +static void virtio_custom_get_config(VirtIODevice *vdev, uint8_t *config)
 +{
 +    VirtIOCustom *vcustom = VIRTIO_CUSTOM(vdev);
-+    memcpy(config, &vcustom->config, sizeof(struct VirtIOCustomConfig));
++    memcpy(config, &vcustom->config, sizeof(VirtIOCustomConfig));
 +}
 +
 +static void virtio_custom_set_config(VirtIODevice *vdev, const uint8_t *config)
 +{
 +    VirtIOCustom *vcustom = VIRTIO_CUSTOM(vdev);
-+    memcpy(&vcustom->config, config, sizeof(struct VirtIOCustomConfig));
++    memcpy(&vcustom->config, config, sizeof(VirtIOCustomConfig));
 +}
++
++#include "exec/cpu-common.h"
 +
 +static void virtio_custom_handle_output(VirtIODevice *vdev, VirtQueue *vq)
 +{
@@ -131,17 +133,68 @@ index 0000000..9556e72
 +    VirtQueueElement *elem;
 +
 +    while ((elem = virtqueue_pop(vq, sizeof(VirtQueueElement))) != NULL) {
-+        vcustom->config.write_count++;
++        size_t out_len = iov_size(elem->out_sg, elem->out_num);
 +
-+        /* If guest supplied in-buffers to read from, return the counter */
-+        if (elem->in_num > 0) {
-+            iov_from_buf(elem->in_sg, elem->in_num, 0,
-+                         &vcustom->config.write_count,
-+                         MIN(sizeof(vcustom->config.write_count),
-+                             iov_size(elem->in_sg, elem->in_num)));
++        if (out_len >= sizeof(struct virtio_custom_dma_cmd)) {
++            struct virtio_custom_dma_cmd cmd;
++            struct virtio_custom_dma_resp resp = { .status = 0, .transferred = 0 };
++
++            iov_to_buf(elem->out_sg, elem->out_num, 0, &cmd, sizeof(cmd));
++
++            if (cmd.len > 0 && cmd.len <= 16 * 1024 * 1024) {
++                uint8_t *buf = g_try_malloc(cmd.len);
++                if (buf) {
++                    switch (cmd.opcode) {
++                    case VIRTIO_CUSTOM_DMA_COPY:
++                        /* DMA Read from Guest Physical Address (GPA) */
++                        cpu_physical_memory_read(cmd.src_addr, buf, cmd.len);
++                        /* DMA Write to Guest Physical Address (GPA) */
++                        cpu_physical_memory_write(cmd.dst_addr, buf, cmd.len);
++                        resp.transferred = cmd.len;
++                        break;
++                    case VIRTIO_CUSTOM_DMA_INVERT:
++                        cpu_physical_memory_read(cmd.src_addr, buf, cmd.len);
++                        for (uint32_t i = 0; i < cmd.len; i++) {
++                            buf[i] = ~buf[i];
++                        }
++                        cpu_physical_memory_write(cmd.dst_addr, buf, cmd.len);
++                        resp.transferred = cmd.len;
++                        break;
++                    case VIRTIO_CUSTOM_DMA_FILL:
++                        memset(buf, (uint8_t)cmd.pattern, cmd.len);
++                        cpu_physical_memory_write(cmd.dst_addr, buf, cmd.len);
++                        resp.transferred = cmd.len;
++                        break;
++                    default:
++                        resp.status = 1; /* Unknown opcode */
++                        break;
++                    }
++                    g_free(buf);
++
++                    vcustom->config.dma_transfers++;
++                    vcustom->config.dma_bytes += resp.transferred;
++                } else {
++                    resp.status = 2; /* Out of memory */
++                }
++            }
++
++            if (elem->in_num > 0) {
++                iov_from_buf(elem->in_sg, elem->in_num, 0, &resp,
++                             MIN(sizeof(resp), iov_size(elem->in_sg, elem->in_num)));
++            }
++            virtqueue_push(vq, elem, sizeof(resp));
++        } else {
++            /* Legacy counter test */
++            vcustom->config.write_count++;
++            if (elem->in_num > 0) {
++                iov_from_buf(elem->in_sg, elem->in_num, 0,
++                             &vcustom->config.write_count,
++                             MIN(sizeof(vcustom->config.write_count),
++                                 iov_size(elem->in_sg, elem->in_num)));
++            }
++            virtqueue_push(vq, elem, 0);
 +        }
 +
-+        virtqueue_push(vq, elem, 0);
 +        g_free(elem);
 +    }
 +    virtio_notify(vdev, vq);
@@ -152,9 +205,11 @@ index 0000000..9556e72
 +    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
 +    VirtIOCustom *vcustom = VIRTIO_CUSTOM(dev);
 +
-+    virtio_init(vdev, VIRTIO_ID_CUSTOM, sizeof(struct VirtIOCustomConfig));
++    virtio_init(vdev, VIRTIO_ID_CUSTOM, sizeof(VirtIOCustomConfig));
 +    vcustom->vq = virtio_add_queue(vdev, 128, virtio_custom_handle_output);
 +    vcustom->config.write_count = 0;
++    vcustom->config.dma_transfers = 0;
++    vcustom->config.dma_bytes = 0;
 +}
 +
 +static void virtio_custom_device_unrealize(DeviceState *dev)
@@ -168,10 +223,12 @@ index 0000000..9556e72
 +static const VMStateDescription vmstate_virtio_custom = {
 +    .name = "virtio-custom",
 +    .minimum_version_id = 1,
-+    .version_id = 1,
++    .version_id = 2,
 +    .fields = (const VMStateField[]) {
 +        VMSTATE_VIRTIO_DEVICE,
 +        VMSTATE_UINT64(config.write_count, VirtIOCustom),
++        VMSTATE_UINT64(config.dma_transfers, VirtIOCustom),
++        VMSTATE_UINT64(config.dma_bytes, VirtIOCustom),
 +        VMSTATE_END_OF_LIST()
 +    },
 +};
@@ -225,7 +282,7 @@ index f12c4aa..ad5d070 100644
  static const char *virtio_id_to_name(uint16_t device_id)
 diff --git a/include/hw/virtio/virtio-custom.h b/include/hw/virtio/virtio-custom.h
 new file mode 100644
-index 0000000..22dedc3
+index 0000000..f39a8b7
 --- /dev/null
 +++ b/include/hw/virtio/virtio-custom.h
 @@ -0,0 +1,40 @@
@@ -253,14 +310,14 @@ index 0000000..22dedc3
 +DECLARE_INSTANCE_CHECKER(VirtIOCustomPCI, VIRTIO_CUSTOM_PCI,
 +                         TYPE_VIRTIO_CUSTOM_PCI)
 +
-+struct QEMU_PACKED VirtIOCustomConfig {
-+  uint64_t write_count;
-+};
++#include "standard-headers/linux/virtio_custom.h"
++
++typedef struct virtio_custom_config VirtIOCustomConfig;
 +
 +struct VirtIOCustom {
 +  VirtIODevice parent_obj;
 +  VirtQueue *vq;
-+  struct VirtIOCustomConfig config;
++  VirtIOCustomConfig config;
 +};
 +
 +struct VirtIOCustomPCI {
@@ -269,6 +326,14 @@ index 0000000..22dedc3
 +};
 +
 +#endif
+diff --git a/include/standard-headers/linux/virtio_custom.h b/include/standard-headers/linux/virtio_custom.h
+new file mode 120000
+index 0000000..0c983d0
+--- /dev/null
++++ b/include/standard-headers/linux/virtio_custom.h
+@@ -0,0 +1 @@
++../../../../../include/uapi_virtio_custom.h
+\ No newline at end of file
 diff --git a/include/standard-headers/linux/virtio_ids.h b/include/standard-headers/linux/virtio_ids.h
 index 7aa2eb7..b04f6b4 100644
 --- a/include/standard-headers/linux/virtio_ids.h

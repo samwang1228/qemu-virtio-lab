@@ -61,7 +61,31 @@ static struct virtio_driver virtio_custom_driver = {
 	.remove = virtio_custom_remove,
 };
 
-module_virtio_driver(virtio_custom_driver);
+static int __init virtio_custom_init(void)
+{
+	int ret;
+
+	ret = virtio_custom_dma_slab_init();
+	if (ret)
+		return ret;
+
+	ret = register_virtio_driver(&virtio_custom_driver);
+	if (ret) {
+		virtio_custom_dma_slab_exit();
+		return ret;
+	}
+
+	return 0;
+}
+
+static void __exit virtio_custom_exit(void)
+{
+	unregister_virtio_driver(&virtio_custom_driver);
+	virtio_custom_dma_slab_exit();
+}
+
+module_init(virtio_custom_init);
+module_exit(virtio_custom_exit);
 
 MODULE_DEVICE_TABLE(virtio, virtio_custom_id_table);
 MODULE_DESCRIPTION("Virtio custom DMA engine driver");

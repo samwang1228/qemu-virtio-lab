@@ -6,28 +6,55 @@
 #include <linux/module.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
-#include <linux/io.h>
+#include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
 
 #include "virtio_custom.h"
 
+static struct kmem_cache *virtio_custom_req_cache;
+
+int virtio_custom_dma_slab_init(void)
+{
+	virtio_custom_req_cache = kmem_cache_create("virtio_custom_req",
+						    sizeof(struct virtio_custom_req),
+						    0,
+						    SLAB_HWCACHE_ALIGN,
+						    NULL);
+	if (!virtio_custom_req_cache)
+		return -ENOMEM;
+
+	return 0;
+}
+
+void virtio_custom_dma_slab_exit(void)
+{
+	kmem_cache_destroy(virtio_custom_req_cache);
+}
+
+static void virtio_custom_req_release(struct kref *ref)
+{
+	struct virtio_custom_req *req = container_of(ref, struct virtio_custom_req, ref);
+
+	kmem_cache_free(virtio_custom_req_cache, req);
+}
+
 static void virtio_custom_vq_callback(struct virtqueue *vq)
 {
 	struct virtio_custom *custom = vq->vdev->priv;
+	struct virtio_custom_req *req;
 	unsigned int len;
-	void *buf;
 	unsigned long flags;
 
 	spin_lock_irqsave(&custom->lock, flags);
-	while ((buf = virtqueue_get_buf(custom->vq, &len)) != NULL) {
-		complete(&custom->dma_done);
+	while ((req = virtqueue_get_buf(custom->vq, &len)) != NULL) {
+		complete(&req->done);
+		kref_put(&req->ref, virtio_custom_req_release);
 	}
 	spin_unlock_irqrestore(&custom->lock, flags);
 }
 
 int virtio_custom_dma_init(struct virtio_custom *custom)
 {
-	init_completion(&custom->dma_done);
 	spin_lock_init(&custom->lock);
 
 	custom->vq = virtio_find_single_vq(custom->vdev, virtio_custom_vq_callback, "custom");
@@ -39,102 +66,119 @@ int virtio_custom_dma_init(struct virtio_custom *custom)
 
 void virtio_custom_dma_cleanup(struct virtio_custom *custom)
 {
+	struct virtio_custom_req *req;
+
+	/* Quiesce hardware before reclaiming in-flight buffers */
 	virtio_reset_device(custom->vdev);
+
+	/* Drop device references for any timed-out requests still on the ring */
+	while ((req = virtqueue_detach_unused_buf(custom->vq)) != NULL) {
+		kref_put(&req->ref, virtio_custom_req_release);
+	}
+
 	custom->vdev->config->del_vqs(custom->vdev);
 }
 
 int virtio_custom_do_dma(struct virtio_custom *custom,
 			 uint32_t opcode,
-			 uint64_t src_phys,
-			 uint64_t dst_phys,
+			 dma_addr_t src_dma,
+			 dma_addr_t dst_dma,
 			 uint32_t len,
 			 uint32_t pattern,
 			 struct virtio_custom_dma_resp *out_resp)
 {
-	struct virtio_custom_dma_cmd *cmd;
-	struct virtio_custom_dma_resp *resp;
+	struct virtio_custom_req *req;
 	struct scatterlist out_sg, in_sg;
 	struct scatterlist *sgs[2];
 	unsigned long flags;
+	bool notify;
 	int ret;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
-	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
-	if (!cmd || !resp) {
-		kfree(cmd);
-		kfree(resp);
+	req = kmem_cache_zalloc(virtio_custom_req_cache, GFP_KERNEL);
+	if (!req)
 		return -ENOMEM;
-	}
 
-	cmd->opcode = opcode;
-	cmd->len = len;
-	cmd->src_addr = src_phys;
-	cmd->dst_addr = dst_phys;
-	cmd->pattern = pattern;
+	init_completion(&req->done);
+	kref_init(&req->ref);
 
-	sg_init_one(&out_sg, cmd, sizeof(*cmd));
-	sg_init_one(&in_sg, resp, sizeof(*resp));
+	req->cmd.opcode = opcode;
+	req->cmd.len = len;
+	req->cmd.src_addr = (uint64_t)src_dma;
+	req->cmd.dst_addr = (uint64_t)dst_dma;
+	req->cmd.pattern = pattern;
+
+	sg_init_one(&out_sg, &req->cmd, sizeof(req->cmd));
+	sg_init_one(&in_sg, &req->resp, sizeof(req->resp));
 	sgs[0] = &out_sg;
 	sgs[1] = &in_sg;
 
-	reinit_completion(&custom->dma_done);
-
 	spin_lock_irqsave(&custom->lock, flags);
-	ret = virtqueue_add_sgs(custom->vq, sgs, 1, 1, cmd, GFP_ATOMIC);
+	/* Take second reference for the Virtqueue / device ownership */
+	kref_get(&req->ref);
+	ret = virtqueue_add_sgs(custom->vq, sgs, 1, 1, req, GFP_ATOMIC);
 	if (ret) {
+		kref_put(&req->ref, virtio_custom_req_release);
 		spin_unlock_irqrestore(&custom->lock, flags);
-		kfree(cmd);
-		kfree(resp);
+		kref_put(&req->ref, virtio_custom_req_release);
 		return ret;
 	}
-	virtqueue_kick(custom->vq);
+	notify = virtqueue_kick_prepare(custom->vq);
 	spin_unlock_irqrestore(&custom->lock, flags);
 
-	if (!wait_for_completion_timeout(&custom->dma_done, msecs_to_jiffies(1000))) {
+	if (notify)
+		virtqueue_notify(custom->vq);
+
+	if (!wait_for_completion_timeout(&req->done, msecs_to_jiffies(1000))) {
 		dev_err(&custom->vdev->dev, "DMA transfer timed out!\n");
-		kfree(cmd);
-		kfree(resp);
+		/*
+		 * Drop caller's reference only. The request memory remains valid
+		 * until either the device completes it later or virtio_custom_dma_cleanup()
+		 * detaches unused buffers after a device reset, preventing Use-After-Free.
+		 */
+		kref_put(&req->ref, virtio_custom_req_release);
 		return -ETIMEDOUT;
 	}
 
 	if (out_resp)
-		*out_resp = *resp;
+		*out_resp = req->resp;
 
-	kfree(cmd);
-	kfree(resp);
-	return 0;
+	ret = (req->resp.status == VIRTIO_CUSTOM_STATUS_OK) ? 0 : -EIO;
+	kref_put(&req->ref, virtio_custom_req_release);
+	return ret;
 }
 
 int virtio_custom_run_self_test(struct virtio_custom *custom)
 {
 	struct device *dev = &custom->vdev->dev;
-	char *src, *dst;
-	phys_addr_t src_phys, dst_phys;
+	/*
+	 * In the Linux Virtio bus model, the underlying PCI/MMIO transport parent
+	 * device owns the DMA mask and IOMMU configuration.
+	 */
+	struct device *dma_dev = custom->vdev->dev.parent;
+	char *src = NULL, *dst = NULL;
+	dma_addr_t src_dma = 0, dst_dma = 0;
 	struct virtio_custom_dma_resp resp;
 	const char *test_msg = "Hello Virtio DMA: Direct Physical Memory Transfer Works!";
 	uint32_t len = strlen(test_msg) + 1;
-	int ret;
+	int ret = 0;
 
-	src = kzalloc(len, GFP_KERNEL);
-	dst = kzalloc(len, GFP_KERNEL);
+	src = dma_alloc_coherent(dma_dev, len, &src_dma, GFP_KERNEL);
+	dst = dma_alloc_coherent(dma_dev, len, &dst_dma, GFP_KERNEL);
 	if (!src || !dst) {
-		kfree(src);
-		kfree(dst);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out;
 	}
 
 	memcpy(src, test_msg, len);
-	src_phys = virt_to_phys(src);
-	dst_phys = virt_to_phys(dst);
 
 	dev_info(dev, "=== Running Virtio DMA Self-Test ===\n");
-	dev_info(dev, "Allocated Guest RAM: src GPA=0x%llx, dst GPA=0x%llx, size=%u bytes\n",
-		 (unsigned long long)src_phys, (unsigned long long)dst_phys, len);
+	dev_info(dev, "Allocated Coherent DMA RAM: src=0x%llx, dst=0x%llx, size=%u bytes\n",
+		 (unsigned long long)src_dma, (unsigned long long)dst_dma, len);
 
 	/* Test 1: DMA Copy */
-	dev_info(dev, "[Test 1/2] Executing DMA COPY (Device reading GPA src -> writing GPA dst)...\n");
+	dev_info(dev, "[Test 1/2] Executing DMA COPY (Device reading src -> writing dst)...\n");
 	ret = virtio_custom_do_dma(custom, VIRTIO_CUSTOM_DMA_COPY,
-				   src_phys, dst_phys, len, 0, &resp);
+				   src_dma, dst_dma, len, 0, &resp);
 	if (ret) {
 		dev_err(dev, "DMA COPY failed: %d\n", ret);
 		goto out;
@@ -152,7 +196,7 @@ int virtio_custom_run_self_test(struct virtio_custom *custom)
 	dev_info(dev, "[Test 2/2] Executing DMA BITWISE INVERT...\n");
 	memset(dst, 0, len);
 	ret = virtio_custom_do_dma(custom, VIRTIO_CUSTOM_DMA_INVERT,
-				   src_phys, dst_phys, len, 0, &resp);
+				   src_dma, dst_dma, len, 0, &resp);
 	if (ret) {
 		dev_err(dev, "DMA INVERT failed: %d\n", ret);
 		goto out;
@@ -170,7 +214,9 @@ int virtio_custom_run_self_test(struct virtio_custom *custom)
 	dev_info(dev, "=== Virtio DMA Engine Verified Successfully! ===\n");
 
 out:
-	kfree(src);
-	kfree(dst);
+	if (src)
+		dma_free_coherent(dma_dev, len, src, src_dma);
+	if (dst)
+		dma_free_coherent(dma_dev, len, dst, dst_dma);
 	return ret;
 }

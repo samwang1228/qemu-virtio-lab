@@ -115,8 +115,10 @@ The custom device keeps the Virtio PCI transport and replaces the device model:
   - `virtio_custom_sysfs.c`: Sysfs debugging interface (`/sys/bus/virtio/devices/virtio*/dma_test`).
   - `virtio_custom.h`: Driver private struct and internal subsystem function prototypes.
 - **DMA Engine Capabilities**:
-  - Implements an asynchronous hardware DMA engine capable of reading from and writing to Guest Physical Addresses (GPA).
+  - Implements an asynchronous hardware DMA engine capable of reading from and writing to Guest Physical / DMA Addresses (`dma_addr_t` / GPA).
   - Supports `VIRTIO_CUSTOM_DMA_COPY` (bulk physical memory memcpy), `VIRTIO_CUSTOM_DMA_FILL` (pattern fill), and `VIRTIO_CUSTOM_DMA_INVERT` (bitwise hardware transform).
+  - Allocates DMA-coherent buffers via `dma_alloc_coherent(vdev->dev.parent, ...)` to guarantee CPU cache coherency and IOMMU compatibility.
+  - Uses a dedicated hardware-cache-aligned Slab Cache (`kmem_cache`), per-request completion (`struct virtio_custom_req`), and reference counting (`struct kref`) with `virtqueue_detach_unused_buf()` on teardown to support concurrent requests and prevent Use-After-Free (UAF) on timeout.
   - QEMU uses `cpu_physical_memory_read()` and `cpu_physical_memory_write()` to access guest RAM directly without CPU intervention.
   - Exposes `/sys/bus/virtio/devices/virtio*/dma_test` in sysfs to re-trigger DMA hardware tests on demand.
 

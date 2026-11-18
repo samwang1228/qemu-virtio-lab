@@ -97,7 +97,7 @@ new file mode 100644
 index 0000000..f1be779
 --- /dev/null
 +++ b/hw/virtio/virtio-custom.c
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,192 @@
 +/*
 + * Virtio Custom Device Implementation
 + *
@@ -109,9 +109,12 @@ index 0000000..f1be779
 +#include "qapi/error.h"
 +#include "qemu/iov.h"
 +#include "qemu/module.h"
++#include "sysemu/dma.h"
 +#include "hw/virtio/virtio.h"
 +#include "hw/virtio/virtio-custom.h"
 +#include "migration/vmstate.h"
++
++#define VIRTIO_CUSTOM_MAX_DMA_LEN (16 * 1024 * 1024)
 +
 +static void virtio_custom_get_config(VirtIODevice *vdev, uint8_t *config)
 +{
@@ -125,8 +128,6 @@ index 0000000..f1be779
 +    memcpy(&vcustom->config, config, sizeof(VirtIOCustomConfig));
 +}
 +
-+#include "exec/cpu-common.h"
-+
 +static void virtio_custom_handle_output(VirtIODevice *vdev, VirtQueue *vq)
 +{
 +    VirtIOCustom *vcustom = VIRTIO_CUSTOM(vdev);
@@ -137,44 +138,67 @@ index 0000000..f1be779
 +
 +        if (out_len >= sizeof(struct virtio_custom_dma_cmd)) {
 +            struct virtio_custom_dma_cmd cmd;
-+            struct virtio_custom_dma_resp resp = { .status = 0, .transferred = 0 };
++            struct virtio_custom_dma_resp resp = {
++                .status = VIRTIO_CUSTOM_STATUS_OK,
++                .transferred = 0,
++            };
 +
 +            iov_to_buf(elem->out_sg, elem->out_num, 0, &cmd, sizeof(cmd));
 +
-+            if (cmd.len > 0 && cmd.len <= 16 * 1024 * 1024) {
++            if (cmd.len == 0 || cmd.len > VIRTIO_CUSTOM_MAX_DMA_LEN) {
++                resp.status = VIRTIO_CUSTOM_STATUS_EINVAL;
++            } else {
 +                uint8_t *buf = g_try_malloc(cmd.len);
-+                if (buf) {
++                if (!buf) {
++                    resp.status = VIRTIO_CUSTOM_STATUS_ENOMEM;
++                } else {
++                    MemTxResult res = MEMTX_OK;
++
 +                    switch (cmd.opcode) {
 +                    case VIRTIO_CUSTOM_DMA_COPY:
-+                        /* DMA Read from Guest Physical Address (GPA) */
-+                        cpu_physical_memory_read(cmd.src_addr, buf, cmd.len);
-+                        /* DMA Write to Guest Physical Address (GPA) */
-+                        cpu_physical_memory_write(cmd.dst_addr, buf, cmd.len);
-+                        resp.transferred = cmd.len;
++                        res = dma_memory_read(vdev->dma_as, cmd.src_addr,
++                                              buf, cmd.len,
++                                              MEMTXATTRS_UNSPECIFIED);
++                        if (res == MEMTX_OK) {
++                            res = dma_memory_write(vdev->dma_as, cmd.dst_addr,
++                                                   buf, cmd.len,
++                                                   MEMTXATTRS_UNSPECIFIED);
++                        }
 +                        break;
 +                    case VIRTIO_CUSTOM_DMA_INVERT:
-+                        cpu_physical_memory_read(cmd.src_addr, buf, cmd.len);
-+                        for (uint32_t i = 0; i < cmd.len; i++) {
-+                            buf[i] = ~buf[i];
++                        res = dma_memory_read(vdev->dma_as, cmd.src_addr,
++                                              buf, cmd.len,
++                                              MEMTXATTRS_UNSPECIFIED);
++                        if (res == MEMTX_OK) {
++                            for (uint32_t i = 0; i < cmd.len; i++) {
++                                buf[i] = ~buf[i];
++                            }
++                            res = dma_memory_write(vdev->dma_as, cmd.dst_addr,
++                                                   buf, cmd.len,
++                                                   MEMTXATTRS_UNSPECIFIED);
 +                        }
-+                        cpu_physical_memory_write(cmd.dst_addr, buf, cmd.len);
-+                        resp.transferred = cmd.len;
 +                        break;
 +                    case VIRTIO_CUSTOM_DMA_FILL:
 +                        memset(buf, (uint8_t)cmd.pattern, cmd.len);
-+                        cpu_physical_memory_write(cmd.dst_addr, buf, cmd.len);
-+                        resp.transferred = cmd.len;
++                        res = dma_memory_write(vdev->dma_as, cmd.dst_addr,
++                                               buf, cmd.len,
++                                               MEMTXATTRS_UNSPECIFIED);
 +                        break;
 +                    default:
-+                        resp.status = 1; /* Unknown opcode */
++                        resp.status = VIRTIO_CUSTOM_STATUS_EINVAL;
 +                        break;
 +                    }
 +                    g_free(buf);
 +
-+                    vcustom->config.dma_transfers++;
-+                    vcustom->config.dma_bytes += resp.transferred;
-+                } else {
-+                    resp.status = 2; /* Out of memory */
++                    if (resp.status == VIRTIO_CUSTOM_STATUS_OK) {
++                        if (res != MEMTX_OK) {
++                            resp.status = VIRTIO_CUSTOM_STATUS_EIO;
++                        } else {
++                            resp.transferred = cmd.len;
++                            vcustom->config.dma_transfers++;
++                            vcustom->config.dma_bytes += resp.transferred;
++                        }
++                    }
 +                }
 +            }
 +

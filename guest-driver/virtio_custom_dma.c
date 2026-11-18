@@ -142,7 +142,22 @@ int virtio_custom_do_dma(struct virtio_custom *custom,
 	if (out_resp)
 		*out_resp = req->resp;
 
-	ret = (req->resp.status == VIRTIO_CUSTOM_STATUS_OK) ? 0 : -EIO;
+	switch (req->resp.status) {
+	case VIRTIO_CUSTOM_STATUS_OK:
+		ret = 0;
+		break;
+	case VIRTIO_CUSTOM_STATUS_EINVAL:
+		ret = -EINVAL;
+		break;
+	case VIRTIO_CUSTOM_STATUS_ENOMEM:
+		ret = -ENOMEM;
+		break;
+	case VIRTIO_CUSTOM_STATUS_EIO:
+	default:
+		ret = -EIO;
+		break;
+	}
+
 	kref_put(&req->ref, virtio_custom_req_release);
 	return ret;
 }
